@@ -13,7 +13,9 @@
      Channel
      DefaultFileRegion
      ChannelFuture
-     ChannelFutureListener]
+     ChannelFutureListener
+     ChannelPipeline
+     ChannelHandler]
     [io.netty.buffer
      ByteBuf]
     [java.nio
@@ -21,20 +23,26 @@
     [io.netty.handler.codec.http
      DefaultHttpRequest DefaultLastHttpContent
      DefaultHttpResponse DefaultFullHttpRequest
+     FullHttpRequest
      HttpHeaders HttpUtil HttpContent
      HttpMethod HttpRequest HttpMessage
      HttpResponse HttpResponseStatus
      DefaultHttpContent
      HttpVersion
      LastHttpContent HttpChunkedInput]
+    [io.netty.handler.timeout
+     IdleState
+     IdleStateEvent
+     IdleStateHandler]
     [io.netty.handler.stream
-     ChunkedFile ChunkedWriteHandler]
+     ChunkedInput ChunkedFile ChunkedWriteHandler]
     [java.io
      File
      RandomAccessFile
      Closeable]
     [java.util.concurrent
-     ConcurrentHashMap]
+     ConcurrentHashMap
+     TimeUnit]
     [java.util.concurrent.atomic
      AtomicBoolean]))
 
@@ -185,22 +193,22 @@
          (if (neg? idx)
            (.getUri req)
            (.substring (.getUri req) 0 idx)))
-  :query-string (let [uri (.getUri req)]
+  :query-string (let [uri (.uri req)]
                   (if (neg? question-mark-index)
                     nil
                     (.substring uri (unchecked-inc question-mark-index))))
   :headers (-> req .headers headers->map)
-  :request-method (-> req .getMethod .name str/lower-case keyword)
+  :request-method (-> req .method .name str/lower-case keyword)
   :body body
   :scheme (if ssl? :https :http)
-  :aleph/keep-alive? (HttpHeaders/isKeepAlive req)
+  :aleph/keep-alive? (HttpUtil/isKeepAlive req)
   :server-name (netty/channel-server-name ch)
   :server-port (netty/channel-server-port ch)
   :remote-addr (netty/channel-remote-address ch))
 
 (p/def-derived-map NettyResponse [^HttpResponse rsp complete body]
-  :status (-> rsp .getStatus .code)
-  :aleph/keep-alive? (HttpHeaders/isKeepAlive rsp)
+  :status (-> rsp .status .code)
+  :aleph/keep-alive? (HttpUtil/isKeepAlive rsp)
   :headers (-> rsp .headers headers->map)
   :aleph/complete complete
   :body body)
@@ -212,7 +220,7 @@
       ssl?
       ch
       (AtomicBoolean. false)
-      (-> req .getUri (.indexOf (int 63))) body)
+      (-> req .uri (.indexOf (int 63))) body)
     :aleph/request-arrived (System/nanoTime)))
 
 (defn netty-response->ring-response [rsp complete body]
@@ -230,7 +238,7 @@
 (def empty-last-content LastHttpContent/EMPTY_LAST_CONTENT)
 
 (let [ary-class (class (byte-array 0))]
-  (defn coerce-element [ch x]
+  (defn coerce-element [x]
     (if (or
           (instance? String x)
           (instance? ary-class x)
@@ -238,6 +246,9 @@
           (instance? ByteBuf x))
       x
       (str x))))
+
+(defn chunked-writer-enabled? [^Channel ch]
+  (some? (-> ch netty/channel .pipeline (.get ChunkedWriteHandler))))
 
 (defn send-streaming-body [ch ^HttpMessage msg body]
 
@@ -248,7 +259,7 @@
 
                    (let [buf (netty/allocate ch)
                          pending? (instance? clojure.lang.IPending body)]
-                     (loop [s (map (partial coerce-element ch) body)]
+                     (loop [s (map coerce-element body)]
                        (cond
 
                          (and pending? (not (realized? s)))
@@ -320,6 +331,10 @@
     (netty/write ch msg)
     (netty/write-and-flush ch ci)))
 
+(defn send-chunked-body [ch ^HttpMessage msg ^ChunkedInput body]
+  (netty/write ch msg)
+  (netty/write-and-flush ch body))
+
 (defn send-file-region [ch ^HttpMessage msg ^File file]
   (let [raf (RandomAccessFile. file "r")
         len (.length raf)
@@ -338,7 +353,7 @@
         (bs/to-byte-buffers {:chunk-size 1e6})
         s/->source))
 
-    (-> ch netty/channel .pipeline (.get ChunkedWriteHandler))
+    (chunked-writer-enabled? ch)
     (send-chunked-file ch msg file)
 
     :else
@@ -353,7 +368,7 @@
 
     (when-not omitted?
       (if (instance? HttpResponse msg)
-        (let [code (-> ^HttpResponse msg .getStatus .code)]
+        (let [code (-> ^HttpResponse msg .status .code)]
           (when-not (or (<= 100 code 199) (= 204 code))
             (try-set-content-length! msg length)))
         (try-set-content-length! msg length)))
@@ -388,6 +403,9 @@
                 (instance? ByteBuf body))
               (send-contiguous-body ch msg body)
 
+              (instance? ChunkedInput body)
+              (send-chunked-body ch msg body)
+
               (instance? File body)
               (send-file-body ch ssl? msg body)
 
@@ -402,3 +420,19 @@
         (handle-cleanup ch f))
 
       f)))
+
+(defn close-on-idle-handler []
+  (netty/channel-handler
+   :user-event-triggered
+   ([_ ctx evt]
+    (if (and (instance? IdleStateEvent evt)
+             (= IdleState/ALL_IDLE (.state ^IdleStateEvent evt)))
+      (netty/close ctx)
+      (.fireUserEventTriggered ctx evt)))))
+
+(defn attach-idle-handlers [^ChannelPipeline pipeline idle-timeout]
+  (if (pos? idle-timeout)
+    (doto pipeline
+      (.addLast "idle" ^ChannelHandler (IdleStateHandler. 0 0 idle-timeout TimeUnit/MILLISECONDS))
+      (.addLast "idle-close" ^ChannelHandler (close-on-idle-handler)))
+    pipeline))

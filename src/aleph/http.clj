@@ -44,7 +44,8 @@
    | `max-chunk-size` | the maximum characters that can be in a single chunk of a streamed request, defaults to `16384`
    | `epoll?` | if `true`, uses `epoll` when available, defaults to `false`
    | `compression?` | when `true` enables http compression, defaults to `false`
-   | `compression-level` | optional compression level, `1` yields the fastest compression and `9` yields the best compression, defaults to `6`. When set, enables http content compression regardless of the `compression?` flag value"
+   | `compression-level` | optional compression level, `1` yields the fastest compression and `9` yields the best compression, defaults to `6`. When set, enables http content compression regardless of the `compression?` flag value
+   | `idle-timeout` | when set, forces keep-alive connections to be closed after an idle time, in milliseconds"
   [handler options]
   (server/start-server handler options))
 
@@ -56,7 +57,7 @@
   (let [scheme (.getScheme uri)
         ssl? (= "https" scheme)]
     (-> (client/http-connection
-          (InetSocketAddress.
+          (InetSocketAddress/createUnresolved
             (.getHost uri)
             (int
               (or
@@ -107,6 +108,7 @@
    | `insecure?` | if `true`, ignores the certificate for any `https://` domains
    | `response-buffer-size` | the amount of the response, in bytes, that is buffered before the request returns, defaults to `65536`.  This does *not* represent the maximum size response that the client can handle (which is unbounded), and is only a means of maximizing performance.
    | `keep-alive?` | if `true`, attempts to reuse connections for multiple requests, defaults to `true`.
+   | `idle-timeout` | when set, forces keep-alive connections to be closed after an idle time, in milliseconds.
    | `epoll?` | if `true`, uses `epoll` when available, defaults to `false`
    | `raw-stream?` | if `true`, bodies of responses will not be buffered at all, and represented as Manifold streams of `io.netty.buffer.ByteBuf` objects rather than as an `InputStream`.  This will minimize copying, but means that care must be taken with Netty's buffer reference counting.  Only recommended for advanced users.
    | `max-initial-line-length` | the maximum length of the initial line (e.g. HTTP/1.0 200 OK), defaults to `65536`
@@ -115,6 +117,7 @@
    | `name-resolver` | specify the mechanism to resolve the address of the unresolved named address. When not set or equals to `:default`, JDK's built-in domain name lookup mechanism is used (blocking). Set to`:noop` not to resolve addresses or pass an instance of `io.netty.resolver.AddressResolverGroup` you need. Note, that if the appropriate connection-pool is created with dns-options shared DNS resolver would be used
    | `proxy-options` | a map to specify proxy settings. HTTP, SOCKS4 and SOCKS5 proxies are supported. Note, that when using proxy `connections-per-host` configuration is still applied to the target host disregarding tunneling settings. If you need to limit number of connections to the proxy itself use `total-connections` setting.
    | `response-executor` | optional `java.util.concurrent.Executor` that will execute response callbacks
+   | `log-activity` | when set, logs all events on each channel (connection) with a log level given. Accepts either one of `:trace`, `:debug`, `:info`, `:warn`, `:error` or an instance of `io.netty.handler.logging.LogLevel`. Note, that this setting *does not* enforce any changes to the logging configuration (default configuration is `INFO`, so you won't see any `DEBUG` or `TRACE` level messages, unless configured explicitly)
 
    Supported `proxy-options` are
 
@@ -142,6 +145,12 @@
          control-period 60000
          middleware middleware/wrap-request
          max-queue-size 65536}}]
+  (when (and (false? (:keep-alive? connection-options))
+             (pos? (:idle-timeout connection-options 0)))
+    (throw
+     (IllegalArgumentException.
+      ":idle-timeout option is not allowed when :keep-alive? is explicitly disabled")))
+
   (let [conn-options' (cond-> connection-options
                         (some? dns-options)
                         (assoc :name-resolver (netty/dns-resolver-group dns-options)))
@@ -227,7 +236,8 @@
      | `pool-timeout` | timeout in milliseconds for the pool to generate a connection
      | `connection-timeout` | timeout in milliseconds for the connection to become established
      | `request-timeout` | timeout in milliseconds for the arrival of a response over the established connection
-     | `read-timeout` | timeout in milliseconds for the response to be completed"
+     | `read-timeout` | timeout in milliseconds for the response to be completed
+     | `follow-redirects?` | whether to follow redirects, defaults to `true`; see `aleph.http.client-middleware/handle-redirects`"
     [{:keys [pool
              middleware
              pool-timeout
@@ -239,8 +249,7 @@
       :or {pool default-connection-pool
            response-executor default-response-executor
            middleware identity
-           connection-timeout 6e4 ;; 60 seconds
-           follow-redirects? true}
+           connection-timeout 6e4} ;; 60 seconds
       :as req}]
 
     (executor/with-executor response-executor
