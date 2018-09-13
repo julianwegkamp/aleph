@@ -11,4 +11,8 @@ dump.rdb
 target/**
 .nrepl*
 /doc
+<<<<<<< HEAD
 /.idea
+=======
+.java-version
+>>>>>>> c3f99dc610f1e33cb866c74a0b238d1c499f6398

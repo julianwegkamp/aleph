@@ -31,7 +31,7 @@
     [io.netty.handler.stream ChunkedWriteHandler]
     [io.netty.handler.codec.http
      DefaultFullHttpResponse
-     HttpContent HttpHeaders
+     HttpContent HttpHeaders HttpUtil
      HttpContentCompressor
      HttpRequest HttpResponse
      HttpResponseStatus DefaultHttpHeaders
@@ -106,7 +106,7 @@
       (map #(HttpHeaders/newEntity %) ["Server" "Connection" "Date"])
 
       [server-value keep-alive-value close-value]
-      (map #(HttpHeaders/newEntity %) ["Aleph/0.4.4" "Keep-Alive" "Close"])]
+      (map #(HttpHeaders/newEntity %) ["Aleph/0.4.6" "Keep-Alive" "Close"])]
   (defn send-response
     [^ChannelHandlerContext ctx keep-alive? ssl? rsp]
     (let [[^HttpResponse rsp body]
@@ -119,13 +119,17 @@
                  (get rsp :body)])))]
 
       (netty/safe-execute ctx
+        (let [headers (.headers rsp)]
 
-        (doto (.headers rsp)
-          (.set ^CharSequence server-name server-value)
-          (.set ^CharSequence connection-name (if keep-alive? keep-alive-value close-value))
-          (.set ^CharSequence date-name (date-header-value ctx)))
+          (when-not (.contains headers ^CharSequence server-name)
+            (.set headers ^CharSequence server-name server-value))
 
-        (http/send-message ctx keep-alive? ssl? rsp body)))))
+          (when-not (.contains headers ^CharSequence date-name)
+            (.set headers ^CharSequence date-name (date-header-value ctx)))
+
+          (.set headers ^CharSequence connection-name (if keep-alive? keep-alive-value close-value))
+
+          (http/send-message ctx keep-alive? ssl? rsp body))))))
 
 ;;;
 
@@ -305,7 +309,7 @@
 
                       (handle-request ctx @request s))))))))]
 
-    (netty/channel-handler
+    (netty/channel-inbound-handler
 
       :exception-caught
       ([_ ctx ex]
@@ -354,8 +358,8 @@
               req
               @previous-response
               body
-              (HttpHeaders/isKeepAlive req))))]
-    (netty/channel-handler
+              (HttpUtil/isKeepAlive req))))]
+    (netty/channel-inbound-handler
 
       :exception-caught
       ([_ ctx ex]
@@ -403,13 +407,15 @@
      raw-stream?
      ssl?
      compression?
-     compression-level]
+     compression-level
+     idle-timeout]
     :or
     {request-buffer-size 16384
      max-initial-line-length 8192
      max-header-size 8192
      max-chunk-size 16384
-     compression? false}}]
+     compression? false
+     idle-timeout 0}}]
   (fn [^ChannelPipeline pipeline]
     (let [handler (if raw-stream?
                     (raw-ring-handler ssl? handler rejected-handler executor request-buffer-size)
@@ -428,6 +434,7 @@
             (let [compressor (HttpContentCompressor. (or compression-level 6))]
               (.addAfter ^ChannelPipeline %1 "http-server" "deflater" compressor))
             (.addAfter ^ChannelPipeline %1 "deflater" "streamer" (ChunkedWriteHandler.))))
+        (http/attach-idle-handlers idle-timeout)
         pipeline-transform))))
 
 ;;;
@@ -508,7 +515,7 @@
        (s/splice out in)
        (reset-meta! {:aleph/channel ch}))
 
-     (netty/channel-handler
+     (netty/channel-inbound-handler
 
        :exception-caught
        ([_ ctx ex]
